@@ -1,0 +1,323 @@
+name: ableton-copilot
+goal: "Voice-activated Ableton assistant launched by a Max for Live device. MCP tools -> OSC -> Ableton."
+requirements:
+  - Ableton Live 11/12 installed
+  - Python 3.10+
+  - Node.js 20+
+  - Rust (for Tauri) or skip desktop launcher
+  - Max for Live (Suite) and Node for Max enabled
+  - Git LFS (for model assets if needed)
+
+# ---- components ----
+components:
+
+  mcp-server:
+    lang: python
+    entry: apps/mcp-server/main.py
+    deps:
+      pip:
+        - "mcp[client]>=0.1.0"              # MCP server runtime (use the standard MCP server SDK)
+        - fastapi>=0.111
+        - uvicorn>=0.30
+        - pydantic>=2.7
+        - python-dotenv>=1.0
+        - requests>=2.32
+        - websockets>=12
+        - redis>=5.0                         # optional event bus
+        - msgpack>=1.0
+        - pyee>=11.1
+        - typing-extensions>=4.12
+    env:
+      - OPENAI_API_KEY
+      - COPILOT_REDIS_URL=redis://localhost:6379/0
+      - OSC_HOST=127.0.0.1
+      - OSC_PORT_OUT=11000    # to Ableton
+      - OSC_PORT_IN=11001     # from Ableton
+    description: >
+      Exposes MCP tools like track.create, track.arm, clip.create, device.add,
+      bpm.set, route.audio, etc. Tools emit normalized commands to the osc-bridge.
+
+  osc-bridge:
+    lang: python
+    entry: apps/osc-bridge/main.py
+    deps:
+      pip:
+        - python-osc>=1.8
+        - fastapi>=0.111
+        - uvicorn>=0.30
+        - pydantic>=2.7
+        - watchdog>=4.0
+    env:
+      - OSC_HOST=127.0.0.1
+      - OSC_PORT_OUT=11000
+      - OSC_PORT_IN=11001
+      - BRIDGE_HTTP_PORT=8777
+    description: >
+      Translates normalized JSON commands into OSC address patterns understood by
+      the Ableton Control Surface (e.g., AbletonOSC). Also exposes /health, /ping.
+
+  voice-daemon:
+    lang: python
+    entry: apps/voice-daemon/main.py
+    deps:
+      pip:
+        - openai>=1.40
+        - faster-whisper>=1.0         # local STT option (or call OpenAI Whisper)
+        - sounddevice>=0.4
+        - webrtcvad>=2.0
+        - openwakeword>=0.6           # wake-word (local) alternative to Porcupine
+        - pydub>=0.25
+        - redis>=5.0
+    env:
+      - OPENAI_API_KEY
+      - VAD_AGGRESSIVENESS=2
+      - WAKEWORD=hey copilot
+      - STT_MODE=openai               # openai|local
+    description: >
+      Mic listener with VAD + wake-word. On wake, records utterance, runs STT,
+      posts {transcript} to MCP /invoke with tool routing hint.
+
+  web-ui:
+    lang: node
+    entry: apps/web-ui
+    framework: nextjs
+    deps:
+      npm:
+        - next@14
+        - react@18
+        - react-dom@18
+        - socket.io@4
+        - socket.io-client@4
+        - zod@3
+        - tailwindcss@3
+        - @radix-ui/react-dialog
+        - @shadcn/ui
+    env:
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8088
+      - NEXT_PUBLIC_HTTP_URL=http://localhost:8080
+    description: >
+      Dashboard: live transcript, command log, scene/track graph, and drag-drop
+      sample panel (future AI sound-alike tools). Opens automatically when M4L device toggles ON.
+
+  desktop-launcher:
+    lang: rust
+    framework: tauri
+    deps:
+      - tauri-cli
+    description: >
+      Optional. One-click tray app to start/stop services and open the web UI.
+
+  m4l-device:
+    lang: max
+    files:
+      - device/ableton_copilot.amxd
+      - node/boot.js
+    description: >
+      A Max for Live Audio Effect: toggling “Enable” triggers boot.js (Node for Max),
+      which spawns the three processes (voice-daemon, mcp-server, osc-bridge) and opens web-ui.
+      Also contains [udpsend]/[udpreceive] for local OSC tests and a status LED.
+
+# ---- run graph ----
+processes:
+  - id: redis
+    run: "docker run --rm -p 6379:6379 redis:7-alpine"
+    optional: true
+
+  - id: osc-bridge
+    cwd: apps/osc-bridge
+    run: "python -m uvicorn main:app --host 127.0.0.1 --port 8777"
+
+  - id: mcp-server
+    cwd: apps/mcp-server
+    run: "python main.py"
+
+  - id: voice-daemon
+    cwd: apps/voice-daemon
+    run: "python main.py"
+
+  - id: web-ui
+    cwd: apps/web-ui
+    run: "npm run dev"
+
+  - id: desktop-launcher
+    cwd: apps/desktop-launcher
+    run: "cargo tauri dev"
+    optional: true
+
+boot:
+  local_dev:
+    order: [redis, osc-bridge, mcp-server, voice-daemon, web-ui]
+  from_m4l:
+    order: [osc-bridge, mcp-server, voice-daemon, web-ui]
+
+# ---- protocols & contracts ----
+contracts:
+
+  osc:
+    transport: UDP
+    to_live_port: 11000
+    from_live_port: 11001
+    address_map:
+      # write ops
+      - name: track.create
+        addr: "/live/track/create"
+        args: [ "name:string", "index:int|optional" ]
+      - name: track.arm
+        addr: "/live/track/arm"
+        args: [ "index:int", "armed:int(0|1)" ]
+      - name: clip.create
+        addr: "/live/clip/create"
+        args: [ "track:int", "scene:int", "length:float" ]
+      - name: device.add
+        addr: "/live/device/add"
+        args: [ "track:int", "device_name:string" ]
+      - name: bpm.set
+        addr: "/live/tempo/set"
+        args: [ "bpm:float" ]
+      - name: param.set
+        addr: "/live/param/set"
+        args: [ "track:int", "device:int", "param:int", "value:float0-1" ]
+      # read ops
+      - name: project.snapshot
+        addr: "/live/project/snapshot"
+        args: []
+    note: >
+      Use an Ableton OSC Control Surface (e.g., an AbletonOSC script) that implements these addresses.
+      If addresses differ, adjust here and in osc-bridge.
+
+  mcp:
+    tools:
+      - id: ableton.track.create
+        desc: "Create an audio or MIDI track."
+        input_schema:
+          type: object
+          props:
+            kind: { enum: ["audio","midi"], default: "midi" }
+            name: { type: string }
+            index: { type: integer, optional: true }
+      - id: ableton.bpm.set
+        desc: "Set project tempo."
+        input_schema:
+          type: object
+          props:
+            bpm: { type: number, minimum: 20, maximum: 999 }
+      - id: ableton.device.add
+        desc: "Add a device by name to a track."
+        input_schema:
+          type: object
+          props:
+            track: { type: integer }
+            device_name: { type: string }
+    routing:
+      rule: "MCP tool -> normalized JSON command -> osc-bridge -> OSC -> Ableton"
+
+  events:
+    bus: redis|websocket
+    topics:
+      - voice.transcript
+      - mcp.invocation
+      - osc.sent
+      - osc.recv
+      - ui.toast
+    ws_port: 8088
+
+# ---- env ----
+env:
+  OPENAI_API_KEY: "sk-..."
+  OSC_HOST: "127.0.0.1"
+  OSC_PORT_OUT: "11000"
+  OSC_PORT_IN: "11001"
+  NEXT_PUBLIC_WS_URL: "ws://localhost:8088"
+
+# ---- scripts (Cursor can generate these) ----
+scaffold:
+  python_app: |
+    from fastapi import FastAPI
+    app = FastAPI()
+    @app.get("/health")
+    def health(): return {"ok": True}
+
+  mcp_server_entry: |
+    # apps/mcp-server/main.py
+    # Pseudo: register MCP tools and forward to osc-bridge
+    import os, json, requests
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+    BRIDGE = "http://127.0.0.1:8777"
+    app = FastAPI()
+    class BpmSet(BaseModel): bpm: float
+    @app.post("/tools/bpm.set")
+    def bpm_set(body: BpmSet):
+        requests.post(f"{BRIDGE}/osc", json={"cmd":"bpm.set","args":{"bpm":body.bpm}})
+        return {"status":"ok"}
+
+  osc_bridge_entry: |
+    # apps/osc-bridge/main.py
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+    from pythonosc.udp_client import SimpleUDPClient
+    import os
+    OSC_HOST = os.getenv("OSC_HOST","127.0.0.1")
+    OSC_PORT_OUT = int(os.getenv("OSC_PORT_OUT","11000"))
+    client = SimpleUDPClient(OSC_HOST, OSC_PORT_OUT)
+    app = FastAPI()
+    class Msg(BaseModel):
+      cmd: str
+      args: dict
+    ADDR = {
+      "bpm.set": "/live/tempo/set",
+      "track.create": "/live/track/create",
+      "track.arm": "/live/track/arm",
+      "clip.create": "/live/clip/create",
+      "device.add": "/live/device/add",
+      "param.set": "/live/param/set",
+    }
+    @app.post("/osc")
+    def send(msg: Msg):
+      addr = ADDR[msg.cmd]
+      # naive: flatten args in a stable order – refine to schema if needed
+      args = list(msg.args.values())
+      client.send_message(addr, args)
+      return {"sent": [addr, args]}
+
+  voice_daemon_entry: |
+    # apps/voice-daemon/main.py
+    # Minimal: press Enter to simulate wake+utterance, then call OpenAI for command
+    import os, requests
+    from openai import OpenAI
+    client = OpenAI()
+    BRIDGE = "http://127.0.0.1:8777"
+    while True:
+      input("say 'hey copilot' (press Enter to simulate)...")
+      user = input("command> ")
+      # naive NLP: detect 'set bpm to X'
+      if user.startswith("set bpm to"):
+        bpm = float(user.split()[-1])
+        requests.post(f"{BRIDGE}/osc", json={"cmd":"bpm.set","args":{"bpm": bpm}})
+        print("ok!")
+
+  m4l_node_boot: |
+    // apps/m4l-device/node/boot.js (Node for Max)
+    const { spawn } = require('child_process');
+    const procs = [];
+    function start(cmd, args, cwd){ 
+      const p = spawn(cmd, args, { cwd, shell:true, detached:true }); 
+      procs.push(p); 
+      p.stdout.on('data', d=>post(d.toString()));
+      p.stderr.on('data', d=>post(d.toString()));
+    }
+    // Paths relative to project root – adjust for your system
+    start('python', ['main.py'], '../../apps/osc-bridge');
+    start('python', ['main.py'], '../../apps/mcp-server');
+    start('python', ['main.py'], '../../apps/voice-daemon');
+    // Open web UI
+    start(process.platform==='win32'?'cmd':'open',
+          process.platform==='win32'?['/c','start','http://localhost:3000']:['http://localhost:3000'],
+          '../../apps/web-ui');
+
+notes:
+  - Install an Ableton OSC Control Surface (e.g., “AbletonOSC” or similar) and enable it in Live’s Preferences > Link/Tempo/MIDI.
+  - Ensure its UDP in/out ports match OSC_PORT_OUT/IN.
+  - Node for Max must be enabled (Options > File/Folder).
+  - For a plugin-style experience: drop the .amxd on the Master track. Toggle “Enable” to boot services.
+  - Replace the naive parsers with MCP tools + LLM planner. The above just wires the pipes.
